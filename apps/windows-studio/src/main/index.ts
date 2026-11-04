@@ -9,6 +9,8 @@ import {
 
 import { ObsSourceServer } from './obs-source/server';
 
+import type { SignalingMessage } from '@mahanaim-cam/protocol';
+
 // Server configuration
 const SIGNALING_PORT = 8765;
 const OBS_SOURCE_PORT = 8766;
@@ -22,9 +24,20 @@ const signalingServer = new SignalingServer(SIGNALING_PORT);
 const obsServer = new ObsSourceServer(OBS_SOURCE_PORT);
 
 // --------------------------------------------------
+// ANDROID MESSAGE FORWARDING
+// --------------------------------------------------
+
+signalingServer.setMessageHandler((message) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('signaling:message', message);
+    }
+});
+
+// --------------------------------------------------
 // IPC HANDLERS
 // --------------------------------------------------
 
+// Get desktop connection information
 ipcMain.handle('connection:get-info', () => {
     return {
         signalingPort: SIGNALING_PORT,
@@ -33,6 +46,29 @@ ipcMain.handle('connection:get-info', () => {
         signalingRunning: signalingServer.isRunning,
     };
 });
+
+// Send signaling messages from renderer to Android
+ipcMain.handle(
+    'signaling:send',
+    (_event, message: SignalingMessage) => {
+        const allowedTypes = [
+            'SESSION_START',
+            'SESSION_END',
+            'SDP_OFFER',
+            'ICE_CANDIDATE',
+        ];
+
+        if (
+            !message ||
+            typeof message !== 'object' ||
+            !allowedTypes.includes(message.type)
+        ) {
+            return false;
+        }
+
+        return signalingServer.sendToPaired(message);
+    },
+);
 
 // --------------------------------------------------
 // CREATE MAIN WINDOW

@@ -2,9 +2,20 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { networkInterfaces } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { parseMessage, serializeMessage } from '@mahanaim-cam/protocol';
+
+import {
+    parseMessage,
+    serializeMessage,
+    type SignalingMessage,
+} from '@mahanaim-cam/protocol';
 
 const HOST = '0.0.0.0';
+
+type SignalingMessageHandler = (message: SignalingMessage) => void;
+
+// --------------------------------------------------
+// NETWORK UTILITIES
+// --------------------------------------------------
 
 export function getLanIPv4Addresses(): string[] {
     const interfaces = networkInterfaces();
@@ -30,8 +41,11 @@ function isPrivateIPv4(address: string): boolean {
 
     if (
         parts.length !== 4 ||
-        parts.some(part =>
-            !Number.isInteger(part) || part < 0 || part > 255
+        parts.some(
+            part =>
+                !Number.isInteger(part) ||
+                part < 0 ||
+                part > 255
         )
     ) {
         return false;
@@ -46,19 +60,98 @@ function isPrivateIPv4(address: string): boolean {
     );
 }
 
+// --------------------------------------------------
+// SIGNALING SERVER
+// --------------------------------------------------
+
 export class SignalingServer {
     private _wss: WebSocketServer | null = null;
     private readonly _port: number;
+
     private _connectionCount = 0;
+    private _clientCounter = 0;
+
     private _pairedDeviceName: string | null = null;
     private _pairedSocket: WebSocket | null = null;
+    private _sessionId: string | null = null;
+
+    private _messageHandler: SignalingMessageHandler | null = null;
 
     constructor(port: number) {
         this._port = port;
     }
 
+    setMessageHandler(handler: SignalingMessageHandler): void {
+        this._messageHandler = handler;
+    }
+
+    // --------------------------------------------------
+    // LOGGING
+    // --------------------------------------------------
+
+    private log(message: string): void {
+        console.log(
+            `[SignalingServer ${new Date().toISOString()}] ${message}`
+        );
+    }
+
+    // --------------------------------------------------
+    // SEND TO PAIRED ANDROID DEVICE
+    // --------------------------------------------------
+
+    sendToPaired(message: SignalingMessage): boolean {
+        const socket = this._pairedSocket;
+
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+            this.log(
+                `SEND FAILED: No paired Android device. Message: ${message.type}`
+            );
+            return false;
+        }
+
+        if (
+            'sessionId' in message &&
+            message.sessionId !== this._sessionId
+        ) {
+            this.log(
+                `SEND REJECTED: Invalid session for ${message.type}`
+            );
+            return false;
+        }
+
+        try {
+            socket.send(serializeMessage(message));
+
+            this.log(
+                `SENT TO ANDROID: ${message.type} | Session: ${
+                    'sessionId' in message
+                        ? message.sessionId
+                        : 'N/A'
+                }`
+            );
+
+            return true;
+        } catch (error) {
+            console.error(
+                '[SignalingServer] Failed to send message:',
+                error
+            );
+
+            return false;
+        }
+    }
+
+    // --------------------------------------------------
+    // START SERVER
+    // --------------------------------------------------
+
     start(): Promise<void> {
         return new Promise((resolve, reject) => {
+            if (this._wss) {
+                resolve();
+                return;
+            }
+
             const server = new WebSocketServer({
                 port: this._port,
                 host: HOST,
@@ -67,20 +160,14 @@ export class SignalingServer {
             this._wss = server;
 
             server.once('listening', () => {
-                console.log(
-                    `[SignalingServer] Listening on ${HOST}:${this._port}`
-                );
+                this.log(`Listening on ${HOST}:${this._port}`);
 
                 const addresses = getLanIPv4Addresses();
 
                 if (addresses.length === 0) {
-                    console.warn(
-                        '[SignalingServer] No private IPv4 address found.'
-                    );
+                    this.log('WARNING: No private IPv4 address found.');
                 } else {
-                    console.log(
-                        '[SignalingServer] Android connection addresses:'
-                    );
+                    this.log('Android connection addresses:');
 
                     for (const address of addresses) {
                         console.log(`  ws://${address}:${this._port}`);
@@ -91,7 +178,10 @@ export class SignalingServer {
             });
 
             server.on('error', (err: Error) => {
-                console.error('[SignalingServer] Server error:', err.message);
+                console.error(
+                    '[SignalingServer] Server error:',
+                    err.message
+                );
 
                 if (this._wss === server) {
                     this._wss = null;
@@ -100,13 +190,19 @@ export class SignalingServer {
                 reject(err);
             });
 
+            // --------------------------------------------------
+            // CLIENT CONNECTION
+            // --------------------------------------------------
+
             server.on('connection', (ws: WebSocket, req) => {
                 this._connectionCount++;
+                this._clientCounter++;
 
+                const clientId = this._clientCounter;
                 const clientIp = req.socket.remoteAddress ?? 'unknown';
 
-                console.log(
-                    `[SignalingServer] Client connected from ${clientIp}`
+                this.log(
+                    `CLIENT #${clientId} CONNECTED | IP: ${clientIp} | Active connections: ${this._connectionCount}`
                 );
 
                 ws.on('message', (data: Buffer) => {
@@ -114,11 +210,24 @@ export class SignalingServer {
                     const msg = parseMessage(raw);
 
                     if (!msg) {
-                        console.warn('[SignalingServer] Invalid message');
+                        this.log(
+                            `CLIENT #${clientId}: INVALID MESSAGE RECEIVED`
+                        );
                         return;
                     }
 
-                    console.log(`[SignalingServer] Received: ${msg.type}`);
+                    const messageSession =
+                        'sessionId' in msg
+                            ? msg.sessionId
+                            : 'N/A';
+
+                    this.log(
+                        `CLIENT #${clientId} RECEIVED: ${msg.type} | Session: ${messageSession}`
+                    );
+
+                    // --------------------------------------------------
+                    // PAIR REQUEST
+                    // --------------------------------------------------
 
                     switch (msg.type) {
                         case 'PAIR_REQUEST': {
@@ -132,10 +241,17 @@ export class SignalingServer {
                                 typeof msg.platformVersion !== 'string' ||
                                 msg.platformVersion.length > 30
                             ) {
-                                ws.send(serializeMessage({
-                                    type: 'PAIR_REJECT',
-                                    reason: 'Invalid pairing information.',
-                                }));
+                                this.log(
+                                    `CLIENT #${clientId}: PAIRING REJECTED - Invalid pairing information`
+                                );
+
+                                ws.send(
+                                    serializeMessage({
+                                        type: 'PAIR_REJECT',
+                                        reason: 'Invalid pairing information.',
+                                    })
+                                );
+
                                 return;
                             }
 
@@ -144,76 +260,168 @@ export class SignalingServer {
                                 this._pairedSocket !== ws &&
                                 this._pairedSocket.readyState === WebSocket.OPEN
                             ) {
-                                ws.send(serializeMessage({
-                                    type: 'PAIR_REJECT',
-                                    reason: 'Another device is already paired.',
-                                }));
+                                this.log(
+                                    `CLIENT #${clientId}: PAIRING REJECTED - Another device is already paired`
+                                );
+
+                                ws.send(
+                                    serializeMessage({
+                                        type: 'PAIR_REJECT',
+                                        reason: 'Another device is already paired.',
+                                    })
+                                );
+
                                 return;
                             }
 
-                            this._pairedSocket = ws;
-                            this._pairedDeviceName = msg.deviceName;
-
                             const sessionId = randomUUID();
 
-                            console.log(
-                                `[SignalingServer] Paired device: ${msg.deviceName}`
+                            this._pairedSocket = ws;
+                            this._pairedDeviceName = msg.deviceName;
+                            this._sessionId = sessionId;
+
+                            this.log(
+                                `CLIENT #${clientId}: PAIRING ACCEPTED | Device: ${msg.deviceName} | Session: ${sessionId}`
                             );
 
-                            ws.send(serializeMessage({
+                            // Confirm pairing to Android.
+                            ws.send(
+                                serializeMessage({
+                                    type: 'PAIR_ACCEPT',
+                                    sessionId,
+                                })
+                            );
+
+                            this.log(
+                                `CLIENT #${clientId}: PAIR_ACCEPT SENT`
+                            );
+
+                            // Notify desktop renderer.
+                            this._messageHandler?.(msg);
+
+                            this._messageHandler?.({
                                 type: 'PAIR_ACCEPT',
                                 sessionId,
-                            }));
+                            });
 
                             break;
                         }
+
+                        // --------------------------------------------------
+                        // HEARTBEAT
+                        // --------------------------------------------------
 
                         case 'HEARTBEAT': {
                             if (typeof msg.timestamp === 'number') {
-                                ws.send(serializeMessage({
-                                    type: 'HEARTBEAT_ACK',
-                                    timestamp: msg.timestamp,
-                                }));
+                                ws.send(
+                                    serializeMessage({
+                                        type: 'HEARTBEAT_ACK',
+                                        timestamp: msg.timestamp,
+                                    })
+                                );
                             }
+
                             break;
                         }
 
-                        default:
-                            console.log(
-                                `[SignalingServer] No handler yet for: ${msg.type}`
+                        // --------------------------------------------------
+                        // ANDROID WEBRTC MESSAGES
+                        // --------------------------------------------------
+
+                        case 'SDP_ANSWER':
+                        case 'ICE_CANDIDATE':
+                        case 'SESSION_END': {
+                            if (ws !== this._pairedSocket) {
+                                this.log(
+                                    `CLIENT #${clientId}: ${msg.type} REJECTED - Client is not paired`
+                                );
+                                return;
+                            }
+
+                            if (
+                                !this._sessionId ||
+                                msg.sessionId !== this._sessionId
+                            ) {
+                                this.log(
+                                    `CLIENT #${clientId}: ${msg.type} REJECTED - Invalid session`
+                                );
+                                return;
+                            }
+
+                            this.log(
+                                `CLIENT #${clientId}: FORWARDING ${msg.type} TO DESKTOP | Session: ${msg.sessionId}`
                             );
+
+                            this._messageHandler?.(msg);
+
+                            break;
+                        }
+
+                        // --------------------------------------------------
+                        // UNHANDLED MESSAGES
+                        // --------------------------------------------------
+
+                        default: {
+                            this.log(
+                                `CLIENT #${clientId}: NO HANDLER FOR ${msg.type}`
+                            );
+                        }
                     }
                 });
 
-                ws.on('close', () => {
+                // --------------------------------------------------
+                // CLIENT DISCONNECTION
+                // --------------------------------------------------
+
+                ws.on('close', (code, reason) => {
                     this._connectionCount = Math.max(
                         0,
                         this._connectionCount - 1
                     );
 
+                    const closeReason = reason.toString('utf8') || '(empty)';
+
+                    this.log(
+                        `CLIENT #${clientId} CLOSED | Code: ${code} | Reason: ${closeReason} | Remaining connections: ${this._connectionCount}`
+                    );
+
                     if (this._pairedSocket === ws) {
-                        console.log(
-                            `[SignalingServer] Paired device disconnected: ${this._pairedDeviceName}`
+                        const endedSessionId = this._sessionId;
+
+                        this.log(
+                            `PAIRED DEVICE DISCONNECTED | Device: ${this._pairedDeviceName} | Session: ${endedSessionId}`
                         );
 
                         this._pairedSocket = null;
                         this._pairedDeviceName = null;
-                    }
+                        this._sessionId = null;
 
-                    console.log(
-                        `[SignalingServer] Client disconnected (remaining: ${this._connectionCount})`
-                    );
+                        if (endedSessionId) {
+                            this.log(
+                                `NOTIFYING DESKTOP: SESSION_END | Session: ${endedSessionId}`
+                            );
+
+                            this._messageHandler?.({
+                                type: 'SESSION_END',
+                                sessionId: endedSessionId,
+                            });
+                        }
+                    }
                 });
 
                 ws.on('error', (err: Error) => {
                     console.error(
-                        '[SignalingServer] WebSocket error:',
+                        `[SignalingServer] CLIENT #${clientId} WebSocket error:`,
                         err.message
                     );
                 });
             });
         });
     }
+
+    // --------------------------------------------------
+    // STOP SERVER
+    // --------------------------------------------------
 
     stop(): Promise<void> {
         return new Promise(resolve => {
@@ -222,16 +430,28 @@ export class SignalingServer {
                 return;
             }
 
-            this._wss.close(() => {
-                console.log('[SignalingServer] Stopped');
-                this._wss = null;
+            const server = this._wss;
+
+            this.log('Stopping signaling server...');
+
+            this._wss = null;
+
+            server.close(() => {
+                this.log('Signaling server stopped');
+
                 this._pairedSocket = null;
                 this._pairedDeviceName = null;
+                this._sessionId = null;
                 this._connectionCount = 0;
+
                 resolve();
             });
         });
     }
+
+    // --------------------------------------------------
+    // GETTERS
+    // --------------------------------------------------
 
     get connectionCount(): number {
         return this._connectionCount;
@@ -239,6 +459,10 @@ export class SignalingServer {
 
     get pairedDeviceName(): string | null {
         return this._pairedDeviceName;
+    }
+
+    get sessionId(): string | null {
+        return this._sessionId;
     }
 
     get isPaired(): boolean {

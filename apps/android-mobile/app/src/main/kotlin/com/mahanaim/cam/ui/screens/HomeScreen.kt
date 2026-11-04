@@ -3,6 +3,8 @@ package com.mahanaim.cam.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -28,7 +30,12 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import com.mahanaim.cam.network.SignalingClient
+import com.mahanaim.cam.network.SignalingState
+import com.mahanaim.cam.network.WebRTCManager
 import com.mahanaim.cam.ui.theme.*
+import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "MahanaimCAM/Camera"
 
@@ -36,10 +43,195 @@ private const val TAG = "MahanaimCAM/Camera"
 fun HomeScreen() {
     val context = androidx.compose.ui.platform.LocalContext.current
 
+    var signalingState by remember {
+        mutableStateOf<SignalingState>(SignalingState.Disconnected)
+    }
+
     var cameraActive by remember { mutableStateOf(false) }
     var isScanning by remember { mutableStateOf(false) }
     var scannedDesktopUrl by remember { mutableStateOf<String?>(null) }
     var scanAfterPermission by remember { mutableStateOf(false) }
+
+    var streamStatus by remember {
+        mutableStateOf("Waiting for desktop connection")
+    }
+
+    // --------------------------------------------------
+    // WEBRTC MESSAGE MANAGEMENT
+    // --------------------------------------------------
+
+    val webRtcManagerRef = remember {
+        AtomicReference<WebRTCManager?>(null)
+    }
+
+    // Protects the manager and pending-message queue.
+    val messageLock = remember {
+        Any()
+    }
+
+    // Messages received before WebRTCManager is ready.
+    val pendingMessages = remember {
+        mutableListOf<JSONObject>()
+    }
+
+    val signalingClient = remember(context) {
+        SignalingClient(
+            context = context,
+
+            onMessageReceived = { message ->
+                synchronized(messageLock) {
+                    val manager = webRtcManagerRef.get()
+
+                    if (manager != null) {
+                        Log.d(
+                            TAG,
+                            "Forwarding ${message.optString("type")} to WebRTC manager"
+                        )
+
+                        manager.handleSignalingMessage(message)
+                    } else {
+                        pendingMessages.add(message)
+
+                        Log.d(
+                            TAG,
+                            "WebRTC manager not ready. Queued ${message.optString("type")}. Pending: ${pendingMessages.size}"
+                        )
+                    }
+                }
+            },
+
+            onStateChanged = { newState ->
+                Handler(Looper.getMainLooper()).post {
+                    Log.d(
+                        TAG,
+                        "Signaling state changed: ${newState::class.simpleName}"
+                    )
+
+                    signalingState = newState
+                }
+            }
+        )
+    }
+
+    // --------------------------------------------------
+    // WEBRTC MANAGER LIFECYCLE
+    // --------------------------------------------------
+
+    LaunchedEffect(signalingState) {
+        when (val state = signalingState) {
+
+            is SignalingState.Paired -> {
+                cameraActive = false
+                isScanning = false
+
+                streamStatus = "Paired. Waiting for video offer..."
+
+                Log.d(
+                    TAG,
+                    "Pairing successful. Creating WebRTC manager for session ${state.sessionId}"
+                )
+
+                val manager = WebRTCManager(
+                    context = context,
+                    signalingClient = signalingClient,
+                    onStatusChanged = { status ->
+                        Handler(Looper.getMainLooper()).post {
+                            streamStatus = status
+                        }
+                    }
+                )
+
+                synchronized(messageLock) {
+                    val previousManager = webRtcManagerRef.getAndSet(manager)
+
+                    if (previousManager != null) {
+                        Log.d(
+                            TAG,
+                            "Stopping previous WebRTC manager"
+                        )
+
+                        previousManager.stop()
+                    }
+
+                    Log.d(
+                        TAG,
+                        "WebRTC manager is ready. Pending messages: ${pendingMessages.size}"
+                    )
+
+                    // Process queued messages in arrival order.
+                    pendingMessages.forEach { message ->
+                        Log.d(
+                            TAG,
+                            "Processing queued message: ${message.optString("type")}"
+                        )
+
+                        manager.handleSignalingMessage(message)
+                    }
+
+                    pendingMessages.clear()
+
+                    Log.d(
+                        TAG,
+                        "Pending WebRTC message queue cleared"
+                    )
+                }
+            }
+
+            // Only terminal states should stop the active manager.
+            is SignalingState.Disconnected,
+            is SignalingState.Rejected,
+            is SignalingState.Failed -> {
+
+                Log.d(
+                    TAG,
+                    "Terminal signaling state. Releasing WebRTC manager."
+                )
+
+                val manager = synchronized(messageLock) {
+                    pendingMessages.clear()
+                    webRtcManagerRef.getAndSet(null)
+                }
+
+                manager?.stop()
+
+                if (state is SignalingState.Disconnected) {
+                    streamStatus = "Disconnected"
+                }
+            }
+
+            // Connecting and AwaitingApproval are transient states.
+            // Do not destroy an existing manager for these states.
+            is SignalingState.Connecting,
+            is SignalingState.AwaitingApproval -> {
+                Log.d(
+                    TAG,
+                    "Transient signaling state. Keeping current WebRTC manager."
+                )
+            }
+        }
+    }
+
+    // --------------------------------------------------
+    // DISPOSAL
+    // --------------------------------------------------
+
+    DisposableEffect(signalingClient) {
+        onDispose {
+            Log.d(TAG, "HomeScreen disposed. Releasing resources.")
+
+            val manager = synchronized(messageLock) {
+                pendingMessages.clear()
+                webRtcManagerRef.getAndSet(null)
+            }
+
+            manager?.stop()
+            signalingClient.disconnect()
+        }
+    }
+
+    // --------------------------------------------------
+    // CAMERA STATE
+    // --------------------------------------------------
 
     var lensFacing by remember {
         mutableIntStateOf(CameraSelector.LENS_FACING_BACK)
@@ -79,6 +271,10 @@ fun HomeScreen() {
         }
     }
 
+    // --------------------------------------------------
+    // MAIN UI
+    // --------------------------------------------------
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -98,11 +294,12 @@ fun HomeScreen() {
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            ConnectionStatusCard(isConnected = false)
+            ConnectionStatusCard(
+                isConnected = signalingState is SignalingState.Paired
+            )
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Camera preview or QR scanner
             if (isScanning && hasPermission) {
                 QrScannerPreview(
                     onQrCodeScanned = { url ->
@@ -135,12 +332,18 @@ fun HomeScreen() {
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = if (scannedDesktopUrl != null) {
-                            "Desktop QR code detected!"
-                        } else if (isScanning) {
-                            "Starting QR scanner..."
-                        } else {
-                            "Camera preview will appear here"
+                        text = when {
+                            signalingState is SignalingState.Paired ->
+                                "Camera is being used for WebRTC streaming"
+
+                            scannedDesktopUrl != null ->
+                                "Desktop QR code detected!"
+
+                            isScanning ->
+                                "Starting QR scanner..."
+
+                            else ->
+                                "Camera preview will appear here"
                         },
                         color = TextMuted,
                         textAlign = TextAlign.Center
@@ -150,7 +353,6 @@ fun HomeScreen() {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Permission error
             permissionMessage?.let {
                 Text(
                     text = it,
@@ -161,7 +363,10 @@ fun HomeScreen() {
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            // Start camera
+            // --------------------------------------------------
+            // START CAMERA
+            // --------------------------------------------------
+
             Button(
                 onClick = {
                     scannedDesktopUrl = null
@@ -174,7 +379,9 @@ fun HomeScreen() {
                         permissionLauncher.launch(Manifest.permission.CAMERA)
                     }
                 },
-                enabled = !cameraActive && !isScanning,
+                enabled = !cameraActive &&
+                    !isScanning &&
+                    signalingState !is SignalingState.Paired,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
@@ -183,15 +390,15 @@ fun HomeScreen() {
                     containerColor = Indigo500
                 )
             ) {
-                Text(
-                    "Start Camera",
-                    fontWeight = FontWeight.SemiBold
-                )
+                Text("Start Camera", fontWeight = FontWeight.SemiBold)
             }
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Stop camera
+            // --------------------------------------------------
+            // STOP CAMERA
+            // --------------------------------------------------
+
             OutlinedButton(
                 onClick = {
                     cameraActive = false
@@ -207,7 +414,10 @@ fun HomeScreen() {
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Switch front/back camera
+            // --------------------------------------------------
+            // SWITCH CAMERA
+            // --------------------------------------------------
+
             OutlinedButton(
                 onClick = {
                     lensFacing =
@@ -228,7 +438,10 @@ fun HomeScreen() {
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Scan desktop QR code
+            // --------------------------------------------------
+            // SCAN DESKTOP QR
+            // --------------------------------------------------
+
             Button(
                 onClick = {
                     scannedDesktopUrl = null
@@ -242,7 +455,8 @@ fun HomeScreen() {
                         permissionLauncher.launch(Manifest.permission.CAMERA)
                     }
                 },
-                enabled = !isScanning,
+                enabled = !isScanning &&
+                    signalingState !is SignalingState.Paired,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(50.dp),
@@ -251,7 +465,6 @@ fun HomeScreen() {
                 Text("Scan Desktop QR Code")
             }
 
-            // Cancel scanning
             if (isScanning) {
                 Spacer(modifier = Modifier.height(8.dp))
 
@@ -267,7 +480,10 @@ fun HomeScreen() {
                 }
             }
 
-            // Display detected desktop address
+            // --------------------------------------------------
+            // CONNECTION CONTROLS
+            // --------------------------------------------------
+
             scannedDesktopUrl?.let { url ->
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -285,12 +501,121 @@ fun HomeScreen() {
                     fontSize = 12.sp,
                     textAlign = TextAlign.Center
                 )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                when (val state = signalingState) {
+
+                    is SignalingState.Disconnected -> {
+                        Button(
+                            onClick = {
+                                signalingClient.connect(url)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(50.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Indigo500
+                            )
+                        ) {
+                            Text("Connect to Desktop")
+                        }
+                    }
+
+                    is SignalingState.Connecting -> {
+                        CircularProgressIndicator(color = Indigo500)
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Text(
+                            "Connecting to desktop...",
+                            color = TextSecondary
+                        )
+                    }
+
+                    is SignalingState.AwaitingApproval -> {
+                        CircularProgressIndicator(color = Indigo500)
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Text(
+                            "Connected. Waiting for pairing response...",
+                            color = TextSecondary,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
+                    is SignalingState.Paired -> {
+                        Text(
+                            "Successfully paired!",
+                            color = StatusOnline,
+                            fontWeight = FontWeight.Bold
+                        )
+
+                        Text(
+                            "Session: ${state.sessionId.take(8)}",
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedButton(
+                            onClick = {
+                                signalingClient.disconnect()
+                                signalingState = SignalingState.Disconnected
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Disconnect")
+                        }
+                    }
+
+                    is SignalingState.Rejected -> {
+                        Text(
+                            "Pairing rejected: ${state.reason}",
+                            color = MaterialTheme.colorScheme.error,
+                            textAlign = TextAlign.Center
+                        )
+
+                        Button(
+                            onClick = {
+                                signalingClient.connect(url)
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Try Again")
+                        }
+                    }
+
+                    is SignalingState.Failed -> {
+                        Text(
+                            "Connection failed: ${state.reason}",
+                            color = MaterialTheme.colorScheme.error,
+                            textAlign = TextAlign.Center
+                        )
+
+                        Button(
+                            onClick = {
+                                signalingClient.connect(url)
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Retry Connection")
+                        }
+                    }
+                }
             }
 
             Spacer(modifier = Modifier.height(14.dp))
 
             Text(
-                text = "Local camera preview\nStreaming will be implemented next",
+                text = if (signalingState is SignalingState.Paired) {
+                    "WebRTC: $streamStatus"
+                } else {
+                    "Local camera preview\nWaiting for Windows Studio connection"
+                },
                 style = MaterialTheme.typography.labelSmall,
                 textAlign = TextAlign.Center,
                 color = TextMuted,
@@ -301,6 +626,10 @@ fun HomeScreen() {
         }
     }
 }
+
+// --------------------------------------------------
+// APP LOGO
+// --------------------------------------------------
 
 @Composable
 private fun AppLogo() {
@@ -337,6 +666,10 @@ private fun AppLogo() {
     }
 }
 
+// --------------------------------------------------
+// CONNECTION STATUS CARD
+// --------------------------------------------------
+
 @Composable
 private fun ConnectionStatusCard(isConnected: Boolean) {
     Surface(
@@ -369,7 +702,7 @@ private fun ConnectionStatusCard(isConnected: Boolean) {
 
                 Text(
                     text = if (isConnected) {
-                        "Streaming to Windows Studio"
+                        "Paired with Windows Studio"
                     } else {
                         "Waiting for Windows connection"
                     },
@@ -380,6 +713,10 @@ private fun ConnectionStatusCard(isConnected: Boolean) {
         }
     }
 }
+
+// --------------------------------------------------
+// LOCAL CAMERA PREVIEW
+// --------------------------------------------------
 
 @Composable
 private fun CameraPreview(
@@ -430,9 +767,16 @@ private fun CameraPreview(
 
                 cameraBound = true
 
-                Log.d(TAG, "Camera preview started: lensFacing=$lensFacing")
+                Log.d(
+                    TAG,
+                    "Camera preview started: lensFacing=$lensFacing"
+                )
             } catch (exception: Exception) {
-                Log.e(TAG, "Failed to start camera preview", exception)
+                Log.e(
+                    TAG,
+                    "Failed to start camera preview",
+                    exception
+                )
             }
         }, mainExecutor)
 
