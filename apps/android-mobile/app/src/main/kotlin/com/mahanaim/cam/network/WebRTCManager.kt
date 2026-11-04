@@ -17,10 +17,17 @@ import org.webrtc.PeerConnectionFactory
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
+import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 
 private const val TAG = "MahanaimCAM/WebRTC"
+
+private const val CAMERA_WIDTH = 1280
+private const val CAMERA_HEIGHT = 720
+private const val CAMERA_FPS = 30
+
+private const val MAX_VIDEO_BITRATE_BPS = 3_000_000
 
 class WebRTCManager(
     context: Context,
@@ -39,6 +46,13 @@ class WebRTCManager(
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
 
+    // Android local preview renderer.
+    private var localPreviewRenderer: SurfaceViewRenderer? = null
+
+    @Volatile
+    var isFrontCamera: Boolean = false
+        private set
+
     private var remoteDescriptionSet = false
 
     private val pendingIceCandidates =
@@ -54,6 +68,11 @@ class WebRTCManager(
     @Synchronized
     fun initialize(): Boolean {
         if (factory != null) return true
+
+        if (disposed) {
+            Log.w(TAG, "Cannot initialize a disposed WebRTC manager")
+            return false
+        }
 
         return try {
             Log.d(TAG, "Initializing WebRTC")
@@ -91,6 +110,149 @@ class WebRTCManager(
 
             release()
 
+            false
+        }
+    }
+
+    // --------------------------------------------------
+    // ATTACH ANDROID LOCAL PREVIEW
+    // --------------------------------------------------
+
+    /**
+     * Attaches an Android SurfaceViewRenderer to the same video track
+     * that is transmitted to the desktop.
+     *
+     * Call this from the Android UI thread.
+     */
+    fun attachLocalPreviewRenderer(
+        renderer: SurfaceViewRenderer
+    ): Boolean {
+        if (disposed) return false
+
+        if (!initialize()) {
+            Log.e(TAG, "Cannot attach preview: WebRTC initialization failed")
+            return false
+        }
+
+        return try {
+            val eglContext = eglBase?.eglBaseContext ?: return false
+
+            if (localPreviewRenderer === renderer) {
+                return true
+            }
+
+            detachLocalPreviewRenderer()
+
+            renderer.init(eglContext, null)
+            renderer.setEnableHardwareScaler(true)
+            renderer.setMirror(false)
+
+            localPreviewRenderer = renderer
+
+            // The camera might already be running.
+            videoTrack?.addSink(renderer)
+
+            Log.d(TAG, "Android local preview renderer attached")
+
+            true
+        } catch (exception: Exception) {
+            Log.e(TAG, "Unable to attach local preview renderer", exception)
+            false
+        }
+    }
+
+    /**
+     * Detaches and releases the Android preview renderer.
+     * The desktop video transmission is not stopped by this operation.
+     */
+    fun detachLocalPreviewRenderer() {
+        val renderer = localPreviewRenderer ?: return
+
+        try {
+            videoTrack?.removeSink(renderer)
+            renderer.release()
+
+            Log.d(TAG, "Android local preview renderer detached")
+        } catch (exception: Exception) {
+            Log.w(TAG, "Error detaching local preview renderer", exception)
+        } finally {
+            localPreviewRenderer = null
+        }
+    }
+
+    // --------------------------------------------------
+    // SWITCH ACTIVE WEBRTC CAMERA
+    // --------------------------------------------------
+
+    /**
+     * Switches the active WebRTC capturer between front and rear cameras.
+     * The existing VideoTrack and PeerConnection remain in place.
+     *
+     * Returns false when the camera capturer is not ready.
+     */
+    fun switchCamera(): Boolean {
+        if (disposed) {
+            Log.w(TAG, "Cannot switch camera: WebRTC manager is disposed")
+            return false
+        }
+
+        val capturer = cameraCapturer
+        if (capturer == null) {
+            Log.w(TAG, "Cannot switch camera: capturer is not ready")
+            onStatusChanged("Camera is not ready yet")
+            return false
+        }
+
+        return try {
+            capturer.switchCamera(
+                object : CameraVideoCapturer.CameraSwitchHandler {
+                    override fun onCameraSwitchDone(frontCamera: Boolean) {
+                        isFrontCamera = frontCamera
+                        localPreviewRenderer?.setMirror(frontCamera)
+
+                        val cameraLabel = if (frontCamera) "Front" else "Rear"
+                        Log.d(TAG, "Switched to $cameraLabel camera")
+                        onStatusChanged("$cameraLabel camera active")
+                    }
+
+                    override fun onCameraSwitchError(errorDescription: String?) {
+                        Log.e(TAG, "Camera switch failed: $errorDescription")
+                        onStatusChanged(
+                            errorDescription?.let { "Camera switch failed: $it" }
+                                ?: "Camera switch failed"
+                        )
+                    }
+                }
+            )
+            true
+        } catch (exception: Exception) {
+            Log.e(TAG, "Unable to request camera switch", exception)
+            onStatusChanged("Unable to switch camera")
+            false
+        }
+    }
+
+    /**
+     * Changes the active camera capture format without recreating the
+     * PeerConnection or renegotiating the WebRTC session.
+     */
+    fun setCaptureFormat(width: Int, height: Int, fps: Int): Boolean {
+        if (disposed) return false
+        val capturer = cameraCapturer ?: run {
+            onStatusChanged("Camera is not ready yet")
+            return false
+        }
+
+        if (width <= 0 || height <= 0 || fps <= 0) return false
+
+        return try {
+            capturer.changeCaptureFormat(width, height, fps)
+            onStatusChanged("Capture quality changed to ${width}x${height} at ${fps} FPS")
+            Log.d(TAG, "Capture format requested: ${width}x${height} @ ${fps} FPS")
+            true
+        } catch (exception: Exception) {
+            Log.e(TAG, "Unable to change capture format", exception)
+            onStatusChanged("Unable to change camera quality")
             false
         }
     }
@@ -190,16 +352,23 @@ class WebRTCManager(
             return
         }
 
-        // Configure video bitrate.
+        // Configure video bitrate and frame rate.
         try {
             val parameters = sender.parameters
 
             parameters.encodings.forEach {
-                it.maxBitrateBps = 2_000_000
-                it.maxFramerate = 30
+                it.maxBitrateBps = MAX_VIDEO_BITRATE_BPS
+                it.maxFramerate = CAMERA_FPS
             }
 
             sender.parameters = parameters
+
+            Log.d(
+                TAG,
+                "Video encoding configuration: " +
+                    "max bitrate=${MAX_VIDEO_BITRATE_BPS / 1_000_000} Mbps, " +
+                    "max FPS=$CAMERA_FPS"
+            )
         } catch (exception: Exception) {
             Log.w(TAG, "Unable to configure video bitrate", exception)
         }
@@ -344,6 +513,7 @@ class WebRTCManager(
             }
 
             cameraCapturer = capturer
+            isFrontCamera = enumerator.isFrontFacing(cameraName)
 
             surfaceTextureHelper = SurfaceTextureHelper.create(
                 "MahanaimCameraThread",
@@ -359,9 +529,9 @@ class WebRTCManager(
             )
 
             capturer.startCapture(
-                1280,
-                720,
-                30
+                CAMERA_WIDTH,
+                CAMERA_HEIGHT,
+                CAMERA_FPS
             )
 
             videoTrack = peerFactory.createVideoTrack(
@@ -369,9 +539,17 @@ class WebRTCManager(
                 videoSource
             )
 
+            // Attach the same camera track to the Android preview.
+            localPreviewRenderer?.let { renderer ->
+                videoTrack?.addSink(renderer)
+
+                renderer.setMirror(isFrontCamera)
+            }
+
             Log.d(
                 TAG,
-                "Camera started: $cameraName at 1280x720, 30 FPS"
+                "Camera started: $cameraName at " +
+                    "${CAMERA_WIDTH}x${CAMERA_HEIGHT}, ${CAMERA_FPS} FPS"
             )
 
             onStatusChanged("Camera active")
@@ -557,6 +735,9 @@ class WebRTCManager(
     fun release() {
         disposed = true
 
+        // Detach and release the Android preview renderer.
+        detachLocalPreviewRenderer()
+
         try {
             cameraCapturer?.stopCapture()
         } catch (exception: Exception) {
@@ -565,6 +746,7 @@ class WebRTCManager(
 
         cameraCapturer?.dispose()
         cameraCapturer = null
+        isFrontCamera = false
 
         peerConnection?.close()
         peerConnection?.dispose()
