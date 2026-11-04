@@ -1,0 +1,30 @@
+{
+  "name": "mahanaim-cam",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MAHANAIM CAM — Church smartphone webcam application",
+  "workspaces": [
+    "apps/windows-studio",
+    "packages/protocol"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/windows-studio",
+    "build": "npm run build --workspace=packages/protocol && npm run build --workspace=apps/windows-studio",
+    "test": "npm run test --workspace=packages/protocol --if-present && npm run test --workspace=apps/windows-studio",
+    "lint": "eslint . --ext .ts,.tsx"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "allowScripts": {
+    "electron@30.5.1": true
+  }
+}

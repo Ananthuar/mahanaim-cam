@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MAHANAIM CAM</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_disconnected">Not Connected</string>
+    <string name="btn_start_camera">Start Camera</string>
+    <string name="btn_scan_qr">Scan QR to Connect</string>
+    <string name="milestone_note">Milestone 1 — Foundation\nCamera streaming not yet active</string>
+</resources>

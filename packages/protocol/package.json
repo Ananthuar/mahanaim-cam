@@ -1,0 +1,16 @@
+{
+    "name": "@mahanaim-cam/protocol",
+    "version": "0.1.0",
+    "private": true,
+    "description": "MAHANAIM CAM — Shared WebSocket signaling protocol types",
+    "main": "dist/messages.js",
+    "types": "dist/messages.d.ts",
+    "scripts": {
+        "build": "tsc",
+        "test": "node --test test/*.test.js",
+        "clean": "rm -rf dist"
+    },
+    "devDependencies": {
+        "typescript": "^5.4.5"
+    }
+}

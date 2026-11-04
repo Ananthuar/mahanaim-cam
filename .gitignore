@@ -1,0 +1,41 @@
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Vite
+.vite/
+
+# Android
+.gradle/
+local.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+apps/android-mobile/.idea/
+apps/android-mobile/app/build/
+apps/android-mobile/build/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+*.swp
+*.swo
+.idea/
+
+# TypeScript
+*.tsbuildinfo

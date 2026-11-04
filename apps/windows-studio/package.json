@@ -1,0 +1,42 @@
+{
+    "name": "windows-studio",
+    "version": "0.1.0",
+    "private": true,
+    "description": "MAHANAIM CAM — Windows Electron desktop application",
+    "main": "dist/main/index.js",
+    "scripts": {
+        "dev": "concurrently -k \"npm run dev:vite\" \"npm run dev:electron\"",
+        "dev:vite": "vite",
+        "dev:electron": "wait-on http://localhost:5173 && tsc -p tsconfig.main.json && electron .",
+        "build": "npm run build:vite && npm run build:electron",
+        "build:vite": "vite build",
+        "build:electron": "tsc -p tsconfig.main.json",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "lint": "eslint src --ext .ts,.tsx",
+        "preview": "vite preview"
+    },
+    "dependencies": {
+        "@mahanaim-cam/protocol": "*",
+        "qrcode.react": "^4.2.0",
+        "ws": "^8.17.0"
+    },
+    "devDependencies": {
+        "@testing-library/jest-dom": "^6.4.2",
+        "@testing-library/react": "^15.0.6",
+        "@types/node": "^20.12.12",
+        "@types/react": "^18.3.1",
+        "@types/react-dom": "^18.3.0",
+        "@types/ws": "^8.5.11",
+        "@vitejs/plugin-react": "^4.2.1",
+        "concurrently": "^8.2.2",
+        "electron": "^30.0.6",
+        "jsdom": "^24.0.0",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "typescript": "^5.4.5",
+        "vite": "^5.2.11",
+        "vitest": "^1.6.0",
+        "wait-on": "^7.2.0"
+    }
+}
